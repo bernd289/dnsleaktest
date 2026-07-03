@@ -4,6 +4,7 @@ set -uo pipefail
 BOLD='\033[1m'
 GREEN='\033[0;32m'
 RED='\033[0;31m'
+YELLOW='\033[0;33m'
 NC='\033[0m'
 
 QUERIES=100
@@ -62,60 +63,61 @@ extract_field() {
     | awk -F': ' -v key="$field" '$1 == key { print substr($0, length(key) + 3); exit }'
 }
 
-echo -e "${BOLD}=== DNS Leak Test ===${NC}\n"
-echo "Running ${QUERIES} queries..."
+run_query() {
+  local nonce qname result resolver geo org proto
 
-declare -A SEEN
-RESULT_COUNT=0
-RESULTS_LIST=""
-FIRST_RAW_RESULT=""
-
-for ((i = 1; i <= QUERIES; i++)); do
   nonce="$(printf '%08x' "$(( (RANDOM << 16) | RANDOM ))")"
   qname="${nonce}.test.dnscheck.tools"
 
   result="$(dig "${DIG_BASE_ARGS[@]}" "$qname" 2>/dev/null || true)"
 
-  if [[ -z "$FIRST_RAW_RESULT" && -n "$result" ]]; then
-    FIRST_RAW_RESULT="$result"
-  fi
-
   resolver="$(extract_field "resolver" "$result")"
-  [[ -z "$resolver" ]] && continue
-  [[ -n "${SEEN[$resolver]:-}" ]] && continue
-
-  SEEN["$resolver"]=1
-  ((RESULT_COUNT++))
+  [[ -z "$resolver" ]] && return 0
 
   geo="$(extract_field "resolverGeo" "$result")"
   org="$(extract_field "resolverOrg" "$result")"
   proto="$(extract_field "proto" "$result")"
 
-  RESULTS_LIST+="${org:-Unknown}|${resolver}|${geo:-Unknown}|${proto:-Unknown}"$'\n'
-done
+  printf '%s|%s|%s|%s\n' \
+    "${org:-Unknown}" \
+    "$resolver" \
+    "${geo:-Unknown}" \
+    "${proto:-Unknown}"
+}
+
+echo -e "${BOLD}=== DNS Leak Test ===${NC}\n"
+echo "Running ${QUERIES} queries..."
+
+RESULTS_LIST="$(
+  for ((i = 1; i <= QUERIES; i++)); do
+    run_query &
+  done
+  wait
+)"
+
+RESULTS_LIST="$(
+    awk -F'|' '!seen[$2]++' <<< "$RESULTS_LIST" \
+    | sort -t'|' -k1,1 -k2,2
+)"
+RESULT_COUNT="$(grep -c '|' <<< "$RESULTS_LIST" || true)"
 
 if (( RESULT_COUNT == 0 )); then
-  echo -e "${RED}Error:${NC} No resolver information could be parsed." >&2
-
-  if [[ -n "$FIRST_RAW_RESULT" ]]; then
-    echo >&2
-    echo "First raw dig result was:" >&2
-    echo "$FIRST_RAW_RESULT" >&2
-  else
-    echo "No DNS response received from dnscheck.tools." >&2
-  fi
-
-  exit 1
+  die "No resolver information could be parsed."
 fi
 
 echo
 echo -e "${BOLD}=== Results ===${NC}\n"
 
-sort <<< "$RESULTS_LIST" | while IFS='|' read -r org resolver geo proto; do
+while IFS='|' read -r org resolver geo proto; do
   [[ -z "$resolver" ]] && continue
   echo -e " ${GREEN}${org}${NC} | ${resolver} | ${geo} | ${proto}"
-done
+done <<< "$RESULTS_LIST"
 
 echo
 echo -e "${BOLD}${RESULT_COUNT} resolver(s) found.${NC}"
-echo
+
+if (( RESULT_COUNT > 1 )); then
+  echo -e "${YELLOW}Potential DNS leak or multiple upstream resolvers detected.${NC}"
+else
+  echo -e "${GREEN}No obvious DNS leak detected.${NC}"
+fi
