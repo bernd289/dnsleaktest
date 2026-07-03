@@ -9,16 +9,18 @@ NC='\033[0m'
 
 QUERIES=100
 TIMEOUT=3
+PARALLEL=20
 INTERFACE=""
 
 usage() {
   cat <<EOF
-Usage: $0 [-i interface_ip] [-q queries] [-t timeout]
+Usage: $0 [-i source_ip] [-q queries] [-t timeout] [-p parallel]
 
 Options:
-  -i  Source IP/interface for dig -b, e.g. 192.168.1.10
+  -i  Source IP for dig -b (must be a local IP bound to an interface), e.g. 192.168.1.10
   -q  Number of DNS queries, default: 100
   -t  Timeout per query in seconds, default: 3
+  -p  Max concurrent queries, default: 20
   -h  Show help
 EOF
 }
@@ -30,11 +32,12 @@ die() {
 
 command -v dig >/dev/null 2>&1 || die "'dig' not found. Install dnsutils/bind-tools."
 
-while getopts ":i:q:t:h" opt; do
+while getopts ":i:q:t:p:h" opt; do
   case "$opt" in
     i) INTERFACE="$OPTARG" ;;
     q) QUERIES="$OPTARG" ;;
     t) TIMEOUT="$OPTARG" ;;
+    p) PARALLEL="$OPTARG" ;;
     h) usage; exit 0 ;;
     :) die "Option -$OPTARG requires an argument." ;;
     \?) die "Unknown option: -$OPTARG" ;;
@@ -43,16 +46,27 @@ done
 
 [[ "$QUERIES" =~ ^[0-9]+$ ]] || die "Queries must be a number."
 [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "Timeout must be a number."
+[[ "$PARALLEL" =~ ^[0-9]+$ ]] || die "Parallel must be a number."
 (( QUERIES > 0 )) || die "Queries must be greater than 0."
 (( TIMEOUT > 0 )) || die "Timeout must be greater than 0."
-
-DIG_BASE_ARGS=(+short "+time=$TIMEOUT" +tries=1 TXT)
+(( PARALLEL > 0 )) || die "Parallel must be greater than 0."
 
 if [[ -n "$INTERFACE" ]]; then
-  DIG_BASE_ARGS=(-b "$INTERFACE" "${DIG_BASE_ARGS[@]}")
-  echo -e "${BOLD}Interface/source bind:${NC} ${INTERFACE}\n"
+  [[ "$INTERFACE" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
+    || die "-i requires a local IPv4 address (dig -b binds to an IP, not an interface name)."
 fi
 
+DIG_BASE_ARGS=(+short "+time=$TIMEOUT" +tries=1 TXT)
+if [[ -n "$INTERFACE" ]]; then
+  DIG_BASE_ARGS=(-b "$INTERFACE" "${DIG_BASE_ARGS[@]}")
+  echo -e "${BOLD}Source IP bind:${NC} ${INTERFACE}\n"
+fi
+
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# Splits on the first ": " only, so values containing further colons
+# (e.g. "resolverGeo: Berlin, DE") are still captured intact.
 extract_field() {
   local field="$1"
   local input="$2"
@@ -64,6 +78,7 @@ extract_field() {
 }
 
 run_query() {
+  local outfile="$1"
   local nonce qname result resolver geo org proto
 
   nonce="$(printf '%08x' "$(( (RANDOM << 16) | RANDOM ))")"
@@ -78,25 +93,33 @@ run_query() {
   org="$(extract_field "resolverOrg" "$result")"
   proto="$(extract_field "proto" "$result")"
 
+  # One file per query -- avoids relying on PIPE_BUF line-atomicity when
+  # many background jobs write to a single shared stream concurrently.
   printf '%s|%s|%s|%s\n' \
     "${org:-Unknown}" \
     "$resolver" \
     "${geo:-Unknown}" \
-    "${proto:-Unknown}"
+    "${proto:-Unknown}" \
+    > "$outfile"
 }
 
 echo -e "${BOLD}=== DNS Leak Test ===${NC}\n"
-echo "Running ${QUERIES} queries..."
+echo "Running ${QUERIES} queries (max ${PARALLEL} concurrent)..."
+
+running=0
+for ((i = 1; i <= QUERIES; i++)); do
+  run_query "$TMPDIR/$i" &
+  (( running++ ))
+  if (( running >= PARALLEL )); then
+    wait -n
+    (( running-- ))
+  fi
+done
+wait
 
 RESULTS_LIST="$(
-  for ((i = 1; i <= QUERIES; i++)); do
-    run_query &
-  done
-  wait
-)"
-
-RESULTS_LIST="$(
-    awk -F'|' '!seen[$2]++' <<< "$RESULTS_LIST" \
+  cat "$TMPDIR"/* 2>/dev/null \
+    | awk -F'|' '!seen[$2]++' \
     | sort -t'|' -k1,1 -k2,2
 )"
 RESULT_COUNT="$(grep -c '|' <<< "$RESULTS_LIST" || true)"
