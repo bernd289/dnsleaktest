@@ -5,6 +5,12 @@ QUERIES=100
 TIMEOUT=3
 PARALLEL=20
 SOURCE_IP=""
+HAVE_WAIT_N=0
+
+if ((BASH_VERSINFO[0] > 4 ||
+     (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3))); then
+  HAVE_WAIT_N=1
+fi
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   BOLD=$'\033[1m'
@@ -25,7 +31,7 @@ usage() {
 Usage: ${0##*/} [-i source_ip] [-q queries] [-t timeout] [-p parallel]
 
 Options:
-  -i  Source IPv4 address for dig -b, e.g. 192.168.1.10
+  -i  Source IPv4/IPv6 address for dig -b, e.g. 192.168.1.10
       (must be assigned locally; this is an IP address, not an interface name)
   -q  Number of DNS queries, default: 100, maximum: 100000
   -t  Timeout per query in seconds, default: 3, maximum: 300
@@ -43,6 +49,10 @@ EOF
 die() {
   printf '%bError:%b %s\n' "$RED" "$NC" "$*" >&2
   exit 1
+}
+
+warn() {
+  printf '%bWarning:%b %s\n' "$YELLOW" "$NC" "$*" >&2
 }
 
 NORMALIZED_INT=0
@@ -75,19 +85,160 @@ valid_ipv4() {
   done
 }
 
+IPV6_GROUP_COUNT=0
+count_ipv6_groups() {
+  local section="$1"
+  local group
+  local -a groups
+
+  IPV6_GROUP_COUNT=0
+  [[ -n "$section" ]] || return 0
+
+  IFS=':' read -r -a groups <<< "$section"
+  for group in "${groups[@]}"; do
+    [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+  done
+  IPV6_GROUP_COUNT=${#groups[@]}
+}
+
+valid_ipv6() {
+  local address="$1"
+  local ipv4_tail
+  local left
+  local right
+  local remainder
+  local left_count
+  local right_count
+
+  [[ "$address" == *:* ]] || return 1
+  [[ "$address" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+  [[ "$address" != *:::* ]] || return 1
+  [[ "$address" != :* || "$address" == ::* ]] || return 1
+  [[ "$address" != *: || "$address" == *:: ]] || return 1
+
+  # An embedded IPv4 address occupies two IPv6 groups.
+  if [[ "$address" == *.* ]]; then
+    ipv4_tail="${address##*:}"
+    valid_ipv4 "$ipv4_tail" || return 1
+    address="${address%:*}:0:0"
+  fi
+
+  if [[ "$address" == *::* ]]; then
+    remainder="${address#*::}"
+    [[ "$remainder" != *::* ]] || return 1
+
+    left="${address%%::*}"
+    right="${address#*::}"
+
+    count_ipv6_groups "$left" || return 1
+    left_count=$IPV6_GROUP_COUNT
+    count_ipv6_groups "$right" || return 1
+    right_count=$IPV6_GROUP_COUNT
+
+    # "::" must replace at least one of the eight groups.
+    ((left_count + right_count < 8))
+  else
+    [[ "$address" != :* && "$address" != *: ]] || return 1
+    count_ipv6_groups "$address" || return 1
+    ((IPV6_GROUP_COUNT == 8))
+  fi
+}
+
+NORMALIZED_IPV6=""
+normalize_ipv6() {
+  local address="$1"
+  local ipv4_tail
+  local ipv4_high
+  local ipv4_low
+  local left
+  local right
+  local missing
+  local group
+  local normalized_group
+  local normalized=""
+  local -a octets
+  local -a left_groups
+  local -a right_groups
+  local -a all_groups
+
+  valid_ipv6 "$address" || return 1
+
+  if [[ "$address" == *.* ]]; then
+    ipv4_tail="${address##*:}"
+    IFS='.' read -r -a octets <<< "$ipv4_tail"
+    printf -v ipv4_high '%x' \
+      "$((10#${octets[0]} * 256 + 10#${octets[1]}))"
+    printf -v ipv4_low '%x' \
+      "$((10#${octets[2]} * 256 + 10#${octets[3]}))"
+    address="${address%:*}:$ipv4_high:$ipv4_low"
+  fi
+
+  left_groups=()
+  right_groups=()
+  all_groups=()
+
+  if [[ "$address" == *::* ]]; then
+    left="${address%%::*}"
+    right="${address#*::}"
+    [[ -z "$left" ]] || IFS=':' read -r -a left_groups <<< "$left"
+    [[ -z "$right" ]] || IFS=':' read -r -a right_groups <<< "$right"
+
+    all_groups=("${left_groups[@]}")
+    missing=$((8 - ${#left_groups[@]} - ${#right_groups[@]}))
+    while ((missing > 0)); do
+      all_groups+=("0")
+      missing=$((missing - 1))
+    done
+    all_groups+=("${right_groups[@]}")
+  else
+    IFS=':' read -r -a all_groups <<< "$address"
+  fi
+
+  for group in "${all_groups[@]}"; do
+    printf -v normalized_group '%x' "$((16#$group))"
+    if [[ -n "$normalized" ]]; then
+      normalized="$normalized:$normalized_group"
+    else
+      normalized="$normalized_group"
+    fi
+  done
+
+  NORMALIZED_IPV6="$normalized"
+}
+
 source_ip_is_local() {
   local wanted="$1"
+  local wanted_normalized=""
+  local candidate_normalized
+  local index
+  local interface
+  local family
+  local address
+  local remainder
+  local address_list
 
-  ip -o -4 address show 2>/dev/null \
-    | awk -v wanted="$wanted" '
-        {
-          split($4, address, "/")
-          if (address[1] == wanted) {
-            found = 1
-          }
-        }
-        END { exit(found ? 0 : 1) }
-      '
+  if valid_ipv6 "$wanted"; then
+    normalize_ipv6 "$wanted" || return 1
+    wanted_normalized="$NORMALIZED_IPV6"
+  fi
+
+  if ! address_list="$(ip -o address show 2>/dev/null)"; then
+    return 2
+  fi
+
+  while read -r index interface family address remainder; do
+    address="${address%%/*}"
+    if [[ "$family" == "inet" && "$address" == "$wanted" ]]; then
+      return 0
+    fi
+    if [[ "$family" == "inet6" && -n "$wanted_normalized" ]] &&
+       normalize_ipv6 "$address"; then
+      candidate_normalized="$NORMALIZED_IPV6"
+      [[ "$candidate_normalized" == "$wanted_normalized" ]] && return 0
+    fi
+  done <<< "$address_list"
+
+  return 1
 }
 
 while getopts ":i:q:t:p:h" opt; do
@@ -118,11 +269,18 @@ PARALLEL=$NORMALIZED_INT
 ((PARALLEL <= QUERIES)) || PARALLEL=$QUERIES
 
 if [[ -n "$SOURCE_IP" ]]; then
-  valid_ipv4 "$SOURCE_IP" \
-    || die "-i requires a valid local IPv4 address (not an interface name)."
+  if ! valid_ipv4 "$SOURCE_IP" && ! valid_ipv6 "$SOURCE_IP"; then
+    die "-i requires a valid local IPv4/IPv6 address (not an interface name)."
+  fi
 
-  if command -v ip >/dev/null 2>&1 && ! source_ip_is_local "$SOURCE_IP"; then
-    die "Source IP $SOURCE_IP is not assigned to a local interface."
+  if command -v ip >/dev/null 2>&1; then
+    source_ip_is_local "$SOURCE_IP"
+    SOURCE_IP_STATUS=$?
+    if ((SOURCE_IP_STATUS == 1)); then
+      die "Source IP $SOURCE_IP is not assigned to a local interface."
+    elif ((SOURCE_IP_STATUS == 2)); then
+      warn "Could not inspect local addresses; dig will validate the source binding."
+    fi
   fi
 fi
 
@@ -140,13 +298,31 @@ if [[ -n "$SOURCE_IP" ]]; then
 fi
 
 WORK_DIR="$(mktemp -d)" || die "Could not create a temporary directory."
+RAW_DIR="$WORK_DIR/raw"
+if ! mkdir "$RAW_DIR"; then
+  rmdir "$WORK_DIR" 2>/dev/null || true
+  die "Could not create the diagnostic directory."
+fi
 PIDS=()
+
+refresh_worker_pids() {
+  local pid
+
+  jobs -pr > "$WORK_DIR/active-pids" 2>/dev/null || true
+  PIDS=()
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] && PIDS+=("$pid")
+  done < "$WORK_DIR/active-pids"
+}
 
 cleanup() {
   local exit_code=$?
 
-  trap - EXIT INT TERM
+  trap - EXIT
+  # A repeated Ctrl+C must not interrupt cleanup halfway through.
+  trap '' INT TERM
 
+  refresh_worker_pids
   if ((${#PIDS[@]} > 0)); then
     kill "${PIDS[@]}" 2>/dev/null || true
     wait "${PIDS[@]}" 2>/dev/null || true
@@ -219,7 +395,8 @@ parse_response() {
 
 run_query() {
   local outfile="$1"
-  local nonce="$2"
+  local rawfile="$2"
+  local nonce="$3"
   local qname="${nonce}.test.dnscheck.tools"
   local result
   local parsed
@@ -236,6 +413,7 @@ run_query() {
   fi
 
   if ! parsed="$(printf '%s\n' "$result" | parse_response)"; then
+    printf '%s\n' "$result" > "$rawfile"
     printf 'PARSE_ERROR\t%s\n' \
       'The response did not contain a resolver field.' \
       > "$outfile"
@@ -258,18 +436,22 @@ NONCE_SEED=$(((RANDOM << 16) | RANDOM))
 
 for ((i = 1; i <= QUERIES; i++)); do
   printf -v nonce '%08x' "$(((NONCE_SEED + i) & 0xffffffff))"
-  run_query "$WORK_DIR/query.$i" "$nonce" &
+  run_query "$WORK_DIR/query.$i" "$RAW_DIR/response.$i" "$nonce" &
   PIDS+=("$!")
 
   if ((${#PIDS[@]} >= PARALLEL)); then
-    wait "${PIDS[0]}" || true
-    PIDS=("${PIDS[@]:1}")
+    if ((HAVE_WAIT_N)); then
+      wait -n || true
+    else
+      # Bash 3.2 fallback: waiting for the oldest worker is compatible but can
+      # briefly under-use the configured parallelism when that worker is slow.
+      wait "${PIDS[0]}" || true
+    fi
+    refresh_worker_pids
   fi
 done
 
-for pid in "${PIDS[@]}"; do
-  wait "$pid" || true
-done
+wait || true
 PIDS=()
 
 RESULT_DATA="$WORK_DIR/all-results.tsv"
@@ -311,22 +493,24 @@ ORG_COUNT="$(
     | awk -F '\t' 'NF >= 2 && !seen[$1]++ { count++ } END { print count + 0 }'
 )"
 
-ECS_LIST="$(
+ECS_DETAILS="$(
   awk -F '\t' '
     $1 == "OK" &&
     $6 != "" &&
     $6 != "None" &&
-    $6 !~ /\/0$/ &&
-    !seen[$6]++ {
-      print $6
+    $6 !~ /\/0$/ {
+      key = $2 SUBSEP $6
+      if (!seen[key]++) {
+        print $3 "\t" $2 "\t" $6
+      }
     }
   ' "$RESULT_DATA" \
-    | LC_ALL=C sort
+    | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 -k3,3
 )"
 
 ECS_COUNT="$(
-  printf '%s\n' "$ECS_LIST" \
-    | awk 'NF > 0 { count++ } END { print count + 0 }'
+  printf '%s\n' "$ECS_DETAILS" \
+    | awk -F '\t' 'NF >= 3 { count++ } END { print count + 0 }'
 )"
 
 if ((RESULT_COUNT == 0)); then
@@ -341,6 +525,16 @@ if ((RESULT_COUNT == 0)); then
   )"
 
   if [[ -n "$FIRST_ERROR" ]]; then
+    FIRST_RAW_FILE="$(
+      find "$RAW_DIR" -type f -name 'response.*' -print 2>/dev/null \
+        | awk 'NR == 1 { print }'
+    )"
+    if [[ -n "$FIRST_RAW_FILE" ]]; then
+      printf 'First unparsable response:\n' >&2
+      while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        printf '  %s\n' "$raw_line" >&2
+      done < "$FIRST_RAW_FILE"
+    fi
     die "No resolver information could be parsed. First error: $FIRST_ERROR"
   fi
   die "No resolver information could be parsed."
@@ -379,11 +573,11 @@ else
 fi
 
 if ((ECS_COUNT > 0)); then
-  printf '%bEDNS Client Subnet disclosure detected:%b' "$YELLOW" "$NC"
-  while IFS= read -r client_subnet; do
-    [[ -n "$client_subnet" ]] && printf ' %s' "$client_subnet"
-  done <<< "$ECS_LIST"
-  printf '\n'
+  printf '%bEDNS Client Subnet disclosure detected:%b\n' "$YELLOW" "$NC"
+  while IFS=$'\t' read -r organization resolver client_subnet; do
+    [[ -n "$resolver" ]] || continue
+    printf ' %s | %s | %s\n' "$organization" "$resolver" "$client_subnet"
+  done <<< "$ECS_DETAILS"
 else
   printf '%bNo non-/0 EDNS Client Subnet was observed.%b\n' "$GREEN" "$NC"
 fi
