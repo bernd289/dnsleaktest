@@ -415,6 +415,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 
 results_file = sys.argv[1]
@@ -441,35 +442,46 @@ if not unknown:
 
 
 def get_json(url):
-    completed = subprocess.run(
-        [
-            "curl",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-redirs",
-            "5",
-            "--connect-timeout",
-            "6",
-            "--max-time",
-            "20",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--header",
-            "Accept: application/rdap+json, application/json",
-            "--user-agent",
-            "dnsleaktest/rdap-enrichment",
-            url,
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=25,
-    )
-    return json.loads(completed.stdout)
+    last_error = None
+    for attempt in range(3):
+        try:
+            completed = subprocess.run(
+                [
+                    "curl",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--max-redirs",
+                    "5",
+                    "--connect-timeout",
+                    "6",
+                    "--max-time",
+                    "20",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--header",
+                    "Accept: application/rdap+json, application/json",
+                    "--user-agent",
+                    "dnsleaktest/rdap-enrichment",
+                    url,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=25,
+            )
+            return json.loads(completed.stdout)
+        except Exception as error:
+            last_error = error
+            if attempt < 2:
+                # Both bootstrap/referral services and authoritative RIRs can
+                # return brief 429/5xx responses. Retry without making a
+                # transient enrichment problem affect the DNS test itself.
+                time.sleep(attempt + 1)
+    raise last_error
 
 
 known_ranges = []
@@ -503,7 +515,7 @@ rdap_cache = []
 
 def rdap_lookup(address):
     for start, end, data in rdap_cache:
-        if start <= address <= end:
+        if start.version == address.version and start <= address <= end:
             return data
 
     encoded = urllib.parse.quote(str(address), safe=":")
@@ -870,6 +882,3 @@ else
   printf '%bThe TXT responses did not include clientSubnet information; ECS disclosure could not be assessed.%b\n' \
     "$YELLOW" "$NC"
 fi
-
-printf 'A resolver-path leak exists only if a listed resolver/provider is not one you expect.\n'
-
