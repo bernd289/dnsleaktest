@@ -5,6 +5,7 @@ QUERIES=100
 TIMEOUT=3
 PARALLEL=20
 SOURCE_IP=""
+ENRICH_UNKNOWN=0
 HAVE_WAIT_N=0
 
 if ((BASH_VERSINFO[0] > 4 ||
@@ -28,9 +29,11 @@ fi
 
 usage() {
   cat <<EOF
-Usage: ${0##*/} [-i source_ip] [-q queries] [-t timeout] [-p parallel]
+Usage: ${0##*/} [-e] [-i source_ip] [-q queries] [-t timeout] [-p parallel]
 
 Options:
+  -e  Enrich missing resolver organizations using dnscheck.tools known ranges
+      and public RDAP data (best effort; requires curl and Python 3)
   -i  Source IPv4/IPv6 address for dig -b, e.g. 192.168.1.10
       (must be assigned locally; this is an IP address, not an interface name)
   -q  Number of DNS queries, default: 100, maximum: 100000
@@ -241,8 +244,9 @@ source_ip_is_local() {
   return 1
 }
 
-while getopts ":i:q:t:p:h" opt; do
+while getopts ":ei:q:t:p:h" opt; do
   case "$opt" in
+    e) ENRICH_UNKNOWN=1 ;;
     i) SOURCE_IP="$OPTARG" ;;
     q) QUERIES="$OPTARG" ;;
     t) TIMEOUT="$OPTARG" ;;
@@ -291,6 +295,13 @@ for dependency in awk find sort mktemp; do
   command -v "$dependency" >/dev/null 2>&1 \
     || die "'$dependency' not found."
 done
+
+if ((ENRICH_UNKNOWN)); then
+  command -v curl >/dev/null 2>&1 \
+    || die "'curl' is required for provider enrichment."
+  command -v python3 >/dev/null 2>&1 \
+    || die "'python3' is required for provider enrichment."
+fi
 
 DIG_BASE_ARGS=(+short "+time=$TIMEOUT" +tries=1)
 if [[ -n "$SOURCE_IP" ]]; then
@@ -385,12 +396,191 @@ parse_response() {
         protocol = "Unknown"
       }
       if (client_subnet == "") {
-        client_subnet = "None"
+        client_subnet = "Unknown"
       }
 
       print resolver, organization, geo, protocol, client_subnet
     }
   '
+}
+
+enrich_unknown_organizations() {
+  local results_file="$1"
+
+  # dnscheck.tools enriches its browser results with known provider ranges and
+  # RDAP. Keep that optional here so the DNS-only test remains dependency-light.
+  python3 - "$results_file" <<'PY'
+import ipaddress
+import json
+import re
+import subprocess
+import sys
+import urllib.parse
+
+results_file = sys.argv[1]
+unknown = []
+seen = set()
+
+with open(results_file, encoding="utf-8", errors="replace") as results:
+    for line in results:
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) < 2 or fields[0] != "Unknown" or fields[1] in seen:
+            continue
+        try:
+            address = ipaddress.ip_address(fields[1])
+        except ValueError:
+            continue
+        seen.add(fields[1])
+        unknown.append(address)
+
+# Always emit a header so the mapping file is non-empty even when every lookup
+# fails. This also keeps the following POSIX awk join correct.
+print("#resolver\torganization")
+if not unknown:
+    raise SystemExit
+
+
+def get_json(url):
+    completed = subprocess.run(
+        [
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-redirs",
+            "5",
+            "--connect-timeout",
+            "6",
+            "--max-time",
+            "20",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--header",
+            "Accept: application/rdap+json, application/json",
+            "--user-agent",
+            "dnsleaktest/rdap-enrichment",
+            url,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    return json.loads(completed.stdout)
+
+
+known_ranges = []
+try:
+    for obj in get_json("https://dnscheck.tools/known-ipranges.json"):
+        description = obj.get("desc")
+        if not isinstance(description, str) or not description:
+            continue
+        for cidr in obj.get("ranges", []):
+            try:
+                known_ranges.append(
+                    (ipaddress.ip_network(cidr, strict=False), description)
+                )
+            except ValueError:
+                pass
+except Exception:
+    # RDAP still provides useful fallback data if the friendly-name list is
+    # temporarily unavailable.
+    pass
+
+
+def known_description(address):
+    for network, description in known_ranges:
+        if address in network:
+            return description
+    return None
+
+
+rdap_cache = []
+
+
+def rdap_lookup(address):
+    for start, end, data in rdap_cache:
+        if start <= address <= end:
+            return data
+
+    encoded = urllib.parse.quote(str(address), safe=":")
+    data = get_json("https://rdap.arin.net/registry/ip/" + encoded)
+    try:
+        start = ipaddress.ip_address(data["startAddress"])
+        end = ipaddress.ip_address(data["endAddress"])
+        if start.version == address.version and end.version == address.version:
+            rdap_cache.append((start, end, data))
+    except (KeyError, ValueError):
+        pass
+    return data
+
+
+def vcard_name(entity):
+    card = entity.get("vcardArray")
+    if not isinstance(card, list) or len(card) < 2:
+        return None, None
+    if not isinstance(card[1], list):
+        return None, None
+
+    name = None
+    kind = None
+    for prop in card[1]:
+        if not isinstance(prop, list) or len(prop) < 4:
+            continue
+        if prop[0] == "fn" and name is None and isinstance(prop[3], str):
+            name = prop[3]
+        elif prop[0] == "kind" and kind is None and isinstance(prop[3], str):
+            kind = prop[3]
+    return name, kind
+
+
+def provider_from_rdap(data):
+    cards = []
+    for entity in data.get("entities", []):
+        if "registrant" not in entity.get("roles", []):
+            continue
+        name, kind = vcard_name(entity)
+        if name:
+            cards.append((name, kind))
+
+    provider = next((name for name, kind in cards if kind == "org"), None)
+    if provider is None and cards:
+        provider = cards[0][0]
+    if provider is None:
+        provider = data.get("name") or data.get("handle")
+    if not isinstance(provider, str):
+        return None
+
+    return re.sub(
+        r",?\s+(?:l\.?l\.?c\.?|ltd\.?|inc\.?)$",
+        "",
+        provider,
+        flags=re.IGNORECASE,
+    )
+
+
+def sanitize(value):
+    return value.replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+
+for address in unknown:
+    description = known_description(address)
+    if description and "{}" not in description:
+        provider = description
+    else:
+        try:
+            provider = provider_from_rdap(rdap_lookup(address))
+        except Exception:
+            provider = None
+        if provider and description:
+            provider = description.replace("{}", provider)
+
+    if provider:
+        print(f"{address}\t{sanitize(provider)}")
+PY
 }
 
 run_query() {
@@ -474,43 +664,18 @@ IFS=$'\t' read -r \
   SUCCESS_COUNT DIG_ERROR_COUNT PARSE_ERROR_COUNT INTERNAL_ERROR_COUNT \
   <<< "$STATS"
 
-RESULTS_LIST="$(
-  awk -F '\t' '
-    $1 == "OK" && !seen[$2]++ {
-      print $3 "\t" $2 "\t" $4 "\t" $5
-    }
-  ' "$RESULT_DATA" \
-    | LC_ALL=C sort -t $'\t' -k1,1 -k2,2
-)"
+BASE_RESULTS_FILE="$WORK_DIR/resolvers.tsv"
+awk -F '\t' '
+  $1 == "OK" && !seen[$2]++ {
+    print $3 "\t" $2 "\t" $4 "\t" $5
+  }
+' "$RESULT_DATA" \
+  | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 \
+  > "$BASE_RESULTS_FILE"
 
 RESULT_COUNT="$(
-  printf '%s\n' "$RESULTS_LIST" \
-    | awk -F '\t' 'NF >= 2 { count++ } END { print count + 0 }'
-)"
-
-ORG_COUNT="$(
-  printf '%s\n' "$RESULTS_LIST" \
-    | awk -F '\t' 'NF >= 2 && !seen[$1]++ { count++ } END { print count + 0 }'
-)"
-
-ECS_DETAILS="$(
-  awk -F '\t' '
-    $1 == "OK" &&
-    $6 != "" &&
-    $6 != "None" &&
-    $6 !~ /\/0$/ {
-      key = $2 SUBSEP $6
-      if (!seen[key]++) {
-        print $3 "\t" $2 "\t" $6
-      }
-    }
-  ' "$RESULT_DATA" \
-    | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 -k3,3
-)"
-
-ECS_COUNT="$(
-  printf '%s\n' "$ECS_DETAILS" \
-    | awk -F '\t' 'NF >= 3 { count++ } END { print count + 0 }'
+  awk -F '\t' 'NF >= 2 { count++ } END { print count + 0 }' \
+    "$BASE_RESULTS_FILE"
 )"
 
 if ((RESULT_COUNT == 0)); then
@@ -540,6 +705,97 @@ if ((RESULT_COUNT == 0)); then
   die "No resolver information could be parsed."
 fi
 
+RESULTS_FILE="$BASE_RESULTS_FILE"
+ENRICHMENT_TARGET_COUNT="$(
+  awk -F '\t' '$1 == "Unknown" { count++ } END { print count + 0 }' \
+    "$BASE_RESULTS_FILE"
+)"
+ENRICHED_COUNT=0
+
+if ((ENRICH_UNKNOWN && ENRICHMENT_TARGET_COUNT > 0)); then
+  PROVIDER_MAP="$WORK_DIR/provider-map.tsv"
+  if enrich_unknown_organizations "$BASE_RESULTS_FILE" > "$PROVIDER_MAP"; then
+    ENRICHED_COUNT="$(
+      awk -F '\t' '$1 != "#resolver" && NF >= 2 { count++ } END { print count + 0 }' \
+        "$PROVIDER_MAP"
+    )"
+    ENRICHED_RESULTS_FILE="$WORK_DIR/enriched-resolvers.tsv"
+    awk -F '\t' '
+      BEGIN { OFS = "\t" }
+      NR == FNR {
+        if ($1 != "#resolver" && NF >= 2) {
+          provider[$1] = $2
+        }
+        next
+      }
+      {
+        if ($1 == "Unknown" && $2 in provider) {
+          $1 = provider[$2]
+        }
+        print
+      }
+    ' "$PROVIDER_MAP" "$BASE_RESULTS_FILE" \
+      | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 \
+      > "$ENRICHED_RESULTS_FILE"
+    RESULTS_FILE="$ENRICHED_RESULTS_FILE"
+  else
+    warn "Provider enrichment failed; DNS results remain usable."
+  fi
+fi
+
+RESULTS_LIST="$(
+  awk '1' "$RESULTS_FILE"
+)"
+
+KNOWN_ORG_COUNT="$(
+  awk -F '\t' '
+    NF >= 2 && $1 != "Unknown" && !seen[$1]++ { count++ }
+    END { print count + 0 }
+  ' "$RESULTS_FILE"
+)"
+
+UNKNOWN_RESOLVER_COUNT="$(
+  awk -F '\t' '$1 == "Unknown" { count++ } END { print count + 0 }' \
+    "$RESULTS_FILE"
+)"
+
+ECS_DETAILS="$(
+  awk -F '\t' '
+    BEGIN { OFS = "\t" }
+    NR == FNR {
+      if (NF >= 2) {
+        organization[$2] = $1
+      }
+      next
+    }
+    $1 == "OK" &&
+    $6 != "" &&
+    $6 != "None" &&
+    $6 != "Unknown" &&
+    $6 !~ /\/0$/ {
+      key = $2 SUBSEP $6
+      if (!seen[key]++) {
+        provider = ($2 in organization) ? organization[$2] : $3
+        print provider, $2, $6
+      }
+    }
+  ' "$RESULTS_FILE" "$RESULT_DATA" \
+    | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 -k3,3
+)"
+
+ECS_COUNT="$(
+  printf '%s\n' "$ECS_DETAILS" \
+    | awk -F '\t' 'NF >= 3 { count++ } END { print count + 0 }'
+)"
+
+ECS_FIELD_COUNT="$(
+  awk -F '\t' '
+    $1 == "OK" && $6 != "" && $6 != "Unknown" { count++ }
+    END { print count + 0 }
+  ' "$RESULT_DATA"
+)"
+ECS_MISSING_COUNT=$((SUCCESS_COUNT - ECS_FIELD_COUNT))
+
 printf '\n%b=== Results ===%b\n\n' "$BOLD" "$NC"
 
 while IFS=$'\t' read -r organization resolver geo protocol; do
@@ -548,10 +804,30 @@ while IFS=$'\t' read -r organization resolver geo protocol; do
     "$GREEN" "$organization" "$NC" "$resolver" "$geo" "$protocol"
 done <<< "$RESULTS_LIST"
 
-printf '\n%b%d resolver egress IP(s) across %d organization(s).%b\n' \
-  "$BOLD" "$RESULT_COUNT" "$ORG_COUNT" "$NC"
+if ((UNKNOWN_RESOLVER_COUNT > 0)); then
+  printf '\n%b%d resolver egress IP(s): %d identified organization(s), %d resolver(s) with unknown organization.%b\n' \
+    "$BOLD" \
+    "$RESULT_COUNT" \
+    "$KNOWN_ORG_COUNT" \
+    "$UNKNOWN_RESOLVER_COUNT" \
+    "$NC"
+else
+  printf '\n%b%d resolver egress IP(s) across %d organization(s).%b\n' \
+    "$BOLD" "$RESULT_COUNT" "$KNOWN_ORG_COUNT" "$NC"
+fi
 printf '%d/%d queries returned parseable resolver information.\n' \
   "$SUCCESS_COUNT" "$QUERIES"
+
+if ((ENRICHED_COUNT > 0)); then
+  printf '%d/%d previously unidentified resolver(s) enriched via known ranges/RDAP.\n' \
+    "$ENRICHED_COUNT" "$ENRICHMENT_TARGET_COUNT"
+fi
+if ((ENRICH_UNKNOWN && ENRICHMENT_TARGET_COUNT > ENRICHED_COUNT)); then
+  printf '%bProvider enrichment left %d resolver(s) unidentified; DNS results remain valid.%b\n' \
+    "$YELLOW" \
+    "$((ENRICHMENT_TARGET_COUNT - ENRICHED_COUNT))" \
+    "$NC"
+fi
 
 if ((SUCCESS_COUNT < QUERIES)); then
   printf '%bUnusable queries: %d dig error(s), %d parse error(s), %d internal error(s).%b\n' \
@@ -562,7 +838,10 @@ if ((SUCCESS_COUNT < QUERIES)); then
     "$NC"
 fi
 
-if ((ORG_COUNT > 1)); then
+if ((UNKNOWN_RESOLVER_COUNT > 0)); then
+  printf '%bAt least one resolver organization could not be identified. Check every resolver manually.%b\n' \
+    "$YELLOW" "$NC"
+elif ((KNOWN_ORG_COUNT > 1)); then
   printf '%bMultiple resolver organizations detected. Check that every one is expected.%b\n' \
     "$YELLOW" "$NC"
 elif ((RESULT_COUNT > 1)); then
@@ -578,8 +857,19 @@ if ((ECS_COUNT > 0)); then
     [[ -n "$resolver" ]] || continue
     printf ' %s | %s | %s\n' "$organization" "$resolver" "$client_subnet"
   done <<< "$ECS_DETAILS"
-else
+  if ((ECS_MISSING_COUNT > 0)); then
+    printf '%bThe clientSubnet field was absent from %d additional response(s).%b\n' \
+      "$YELLOW" "$ECS_MISSING_COUNT" "$NC"
+  fi
+elif ((ECS_FIELD_COUNT == SUCCESS_COUNT)); then
   printf '%bNo non-/0 EDNS Client Subnet was observed.%b\n' "$GREEN" "$NC"
+elif ((ECS_FIELD_COUNT > 0)); then
+  printf '%bNo non-/0 EDNS Client Subnet was observed in %d response(s); the clientSubnet field was absent from %d response(s).%b\n' \
+    "$YELLOW" "$ECS_FIELD_COUNT" "$ECS_MISSING_COUNT" "$NC"
+else
+  printf '%bThe TXT responses did not include clientSubnet information; ECS disclosure could not be assessed.%b\n' \
+    "$YELLOW" "$NC"
 fi
 
 printf 'A resolver-path leak exists only if a listed resolver/provider is not one you expect.\n'
+
