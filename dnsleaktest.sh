@@ -6,6 +6,7 @@ TIMEOUT=3
 PARALLEL=20
 SOURCE_IP=""
 ENRICH_UNKNOWN=0
+ENRICHMENT_BUDGET=30
 HAVE_WAIT_N=0
 
 if ((BASH_VERSINFO[0] > 4 ||
@@ -32,8 +33,9 @@ usage() {
 Usage: ${0##*/} [-e] [-i source_ip] [-q queries] [-t timeout] [-p parallel]
 
 Options:
-  -e  Enrich missing resolver organizations using dnscheck.tools known ranges
-      and public RDAP data (best effort; requires curl and Python 3)
+  -e  Enrich missing resolver organizations. Checks dnscheck.tools known
+      ranges, then sends still-unknown resolver IPs to public RDAP services
+      (best effort; ${ENRICHMENT_BUDGET}s total budget; requires curl and Python 3)
   -i  Source IPv4/IPv6 address for dig -b, e.g. 192.168.1.10
       (must be assigned locally; this is an IP address, not an interface name)
   -q  Number of DNS queries, default: 100, maximum: 100000
@@ -409,7 +411,7 @@ enrich_unknown_organizations() {
 
   # dnscheck.tools enriches its browser results with known provider ranges and
   # RDAP. Keep that optional here so the DNS-only test remains dependency-light.
-  python3 - "$results_file" <<'PY'
+  python3 - "$results_file" "$ENRICHMENT_BUDGET" <<'PY'
 import ipaddress
 import json
 import re
@@ -419,6 +421,8 @@ import time
 import urllib.parse
 
 results_file = sys.argv[1]
+budget_seconds = float(sys.argv[2])
+deadline = time.monotonic() + budget_seconds
 unknown = []
 seen = set()
 
@@ -441,9 +445,15 @@ if not unknown:
     raise SystemExit
 
 
-def get_json(url):
+def get_json(url, attempts=3, request_cap=10.0):
     last_error = None
-    for attempt in range(3):
+    for attempt in range(attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("provider enrichment time budget exhausted")
+
+        request_timeout = min(request_cap, max(0.5, remaining))
+        connect_timeout = min(4.0, request_timeout)
         try:
             completed = subprocess.run(
                 [
@@ -455,9 +465,9 @@ def get_json(url):
                     "--max-redirs",
                     "5",
                     "--connect-timeout",
-                    "6",
+                    f"{connect_timeout:.1f}",
                     "--max-time",
-                    "20",
+                    f"{request_timeout:.1f}",
                     "--proto",
                     "=https",
                     "--proto-redir",
@@ -471,22 +481,29 @@ def get_json(url):
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=25,
+                timeout=request_timeout + 1,
             )
             return json.loads(completed.stdout)
         except Exception as error:
             last_error = error
-            if attempt < 2:
+            if attempt + 1 < attempts:
                 # Both bootstrap/referral services and authoritative RIRs can
                 # return brief 429/5xx responses. Retry without making a
                 # transient enrichment problem affect the DNS test itself.
-                time.sleep(attempt + 1)
+                pause = min(attempt + 1, max(0, deadline - time.monotonic()))
+                if pause <= 0:
+                    break
+                time.sleep(pause)
     raise last_error
 
 
 known_ranges = []
 try:
-    for obj in get_json("https://dnscheck.tools/known-ipranges.json"):
+    for obj in get_json(
+        "https://dnscheck.tools/known-ipranges.json",
+        attempts=2,
+        request_cap=5.0,
+    ):
         description = obj.get("desc")
         if not isinstance(description, str) or not description:
             continue
@@ -519,7 +536,9 @@ def rdap_lookup(address):
             return data
 
     encoded = urllib.parse.quote(str(address), safe=":")
-    data = get_json("https://rdap.arin.net/registry/ip/" + encoded)
+    data = get_json(
+        "https://rdap-bootstrap.arin.net/bootstrap/ip/" + encoded
+    )
     try:
         start = ipaddress.ip_address(data["startAddress"])
         end = ipaddress.ip_address(data["endAddress"])
@@ -725,6 +744,8 @@ ENRICHMENT_TARGET_COUNT="$(
 ENRICHED_COUNT=0
 
 if ((ENRICH_UNKNOWN && ENRICHMENT_TARGET_COUNT > 0)); then
+  printf 'Enriching %d unidentified resolver(s) (up to %ds)...\n' \
+    "$ENRICHMENT_TARGET_COUNT" "$ENRICHMENT_BUDGET"
   PROVIDER_MAP="$WORK_DIR/provider-map.tsv"
   if enrich_unknown_organizations "$BASE_RESULTS_FILE" > "$PROVIDER_MAP"; then
     ENRICHED_COUNT="$(
@@ -800,13 +821,16 @@ ECS_COUNT="$(
     | awk -F '\t' 'NF >= 3 { count++ } END { print count + 0 }'
 )"
 
-ECS_FIELD_COUNT="$(
+ECS_OPTION_COUNT="$(
   awk -F '\t' '
-    $1 == "OK" && $6 != "" && $6 != "Unknown" { count++ }
+    $1 == "OK" &&
+    $6 != "" &&
+    $6 != "None" &&
+    $6 != "Unknown" { count++ }
     END { print count + 0 }
   ' "$RESULT_DATA"
 )"
-ECS_MISSING_COUNT=$((SUCCESS_COUNT - ECS_FIELD_COUNT))
+NO_ECS_OPTION_COUNT=$((SUCCESS_COUNT - ECS_OPTION_COUNT))
 
 printf '\n%b=== Results ===%b\n\n' "$BOLD" "$NC"
 
@@ -869,16 +893,14 @@ if ((ECS_COUNT > 0)); then
     [[ -n "$resolver" ]] || continue
     printf ' %s | %s | %s\n' "$organization" "$resolver" "$client_subnet"
   done <<< "$ECS_DETAILS"
-  if ((ECS_MISSING_COUNT > 0)); then
-    printf '%bThe clientSubnet field was absent from %d additional response(s).%b\n' \
-      "$YELLOW" "$ECS_MISSING_COUNT" "$NC"
+  if ((NO_ECS_OPTION_COUNT > 0)); then
+    printf '%bNo ECS option was forwarded in %d additional response(s).%b\n' \
+      "$GREEN" "$NO_ECS_OPTION_COUNT" "$NC"
   fi
-elif ((ECS_FIELD_COUNT == SUCCESS_COUNT)); then
-  printf '%bNo non-/0 EDNS Client Subnet was observed.%b\n' "$GREEN" "$NC"
-elif ((ECS_FIELD_COUNT > 0)); then
-  printf '%bNo non-/0 EDNS Client Subnet was observed in %d response(s); the clientSubnet field was absent from %d response(s).%b\n' \
-    "$YELLOW" "$ECS_FIELD_COUNT" "$ECS_MISSING_COUNT" "$NC"
+elif ((ECS_OPTION_COUNT > 0)); then
+  printf '%bOnly /0 EDNS Client Subnet options were observed; no client subnet was disclosed.%b\n' \
+    "$GREEN" "$NC"
 else
-  printf '%bThe TXT responses did not include clientSubnet information; ECS disclosure could not be assessed.%b\n' \
-    "$YELLOW" "$NC"
+  printf '%bNo resolver forwarded an EDNS Client Subnet option in the observed queries.%b\n' \
+    "$GREEN" "$NC"
 fi
