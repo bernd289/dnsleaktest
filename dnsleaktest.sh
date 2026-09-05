@@ -356,6 +356,78 @@ parse_response() {
   awk '
     BEGIN { OFS = "\t" }
 
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+
+    function parse_from(value, endpoint, metadata, hashpos, spacepos,
+                        group, closepos, rest, nextpos) {
+      value = trim(value)
+      spacepos = index(value, " ")
+      if (spacepos > 0) {
+        endpoint = substr(value, 1, spacepos - 1)
+        metadata = trim(substr(value, spacepos + 1))
+      } else {
+        endpoint = value
+        metadata = ""
+      }
+
+      hashpos = index(endpoint, "#")
+      if (hashpos > 1) {
+        resolver = substr(endpoint, 1, hashpos - 1)
+      }
+
+      if (metadata == "") {
+        return
+      }
+
+      # Some deployments render every metadata field in parentheses:
+      # FROM: IP#PORT (organization) (geo) (protocol)
+      if (substr(metadata, 1, 1) == "(") {
+        rest = metadata
+        closepos = index(rest, ")")
+        if (closepos > 1) {
+          organization = substr(rest, 2, closepos - 2)
+          rest = trim(substr(rest, closepos + 1))
+        }
+        if (substr(rest, 1, 1) == "(") {
+          closepos = index(rest, ")")
+          if (closepos > 1) {
+            geo = substr(rest, 2, closepos - 2)
+            rest = trim(substr(rest, closepos + 1))
+          }
+        }
+        if (substr(rest, 1, 1) == "(") {
+          closepos = index(rest, ")")
+          if (closepos > 1) {
+            group = substr(rest, 2, closepos - 2)
+            if (group ~ /^(UDP|TCP|TLS|QUIC|HTTPS)$/) {
+              protocol = group
+            }
+          }
+        }
+        return
+      }
+
+      # Current upstream format:
+      # FROM: IP#PORT organization (geo)
+      # PROTO: protocol [TLS details]
+      nextpos = 0
+      rest = metadata
+      while ((spacepos = index(rest, " (")) > 0) {
+        nextpos += spacepos
+        rest = substr(rest, spacepos + 2)
+      }
+      if (nextpos > 0 && substr(metadata, length(metadata), 1) == ")") {
+        organization = trim(substr(metadata, 1, nextpos - 1))
+        geo = substr(metadata, nextpos + 2, length(metadata) - nextpos - 2)
+      } else {
+        organization = metadata
+      }
+    }
+
     /^".*"$/ {
       line = $0
       sub(/^"/, "", line)
@@ -369,7 +441,9 @@ parse_response() {
 
       key = substr(line, 1, separator - 1)
       value = substr(line, separator + 2)
+      upper_key = toupper(key)
 
+      # Legacy dnscheck.tools response fields.
       if (key == "resolver") {
         resolver = value
       } else if (key == "resolverGeo") {
@@ -380,6 +454,14 @@ parse_response() {
         protocol = value
       } else if (key == "clientSubnet") {
         client_subnet = value
+      # dnscheck.tools response format introduced in August 2026.
+      } else if (upper_key == "FROM") {
+        parse_from(value)
+      } else if (upper_key == "PROTO") {
+        protocol = value
+      } else if (upper_key == "ECS") {
+        split(value, ecs_parts, /[[:space:]]+/)
+        client_subnet = ecs_parts[1]
       }
     }
 
@@ -636,7 +718,7 @@ run_query() {
   if ! parsed="$(printf '%s\n' "$result" | parse_response)"; then
     printf '%s\n' "$result" > "$rawfile"
     printf 'PARSE_ERROR\t%s\n' \
-      'The response did not contain a resolver field.' \
+      'The response did not contain parseable resolver information.' \
       > "$outfile"
     return 0
   fi
