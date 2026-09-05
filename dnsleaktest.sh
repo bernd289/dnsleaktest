@@ -362,8 +362,23 @@ parse_response() {
       return value
     }
 
+    # Return the matching closing parenthesis, allowing nested metadata.
+    function group_end(value, position, depth, character) {
+      depth = 0
+      for (position = 1; position <= length(value); position++) {
+        character = substr(value, position, 1)
+        if (character == "(") {
+          depth++
+        } else if (character == ")" && --depth == 0) {
+          return position
+        }
+      }
+      return 0
+    }
+
     function parse_from(value, endpoint, metadata, hashpos, spacepos,
-                        group, closepos, rest, nextpos) {
+                        group, closepos, rest, nextpos, position, depth,
+                        character) {
       value = trim(value)
       spacepos = index(value, " ")
       if (spacepos > 0) {
@@ -387,20 +402,20 @@ parse_response() {
       # FROM: IP#PORT (organization) (geo) (protocol)
       if (substr(metadata, 1, 1) == "(") {
         rest = metadata
-        closepos = index(rest, ")")
+        closepos = group_end(rest)
         if (closepos > 1) {
           organization = substr(rest, 2, closepos - 2)
           rest = trim(substr(rest, closepos + 1))
         }
         if (substr(rest, 1, 1) == "(") {
-          closepos = index(rest, ")")
+          closepos = group_end(rest)
           if (closepos > 1) {
             geo = substr(rest, 2, closepos - 2)
             rest = trim(substr(rest, closepos + 1))
           }
         }
         if (substr(rest, 1, 1) == "(") {
-          closepos = index(rest, ")")
+          closepos = group_end(rest)
           if (closepos > 1) {
             group = substr(rest, 2, closepos - 2)
             if (group ~ /^(UDP|TCP|TLS|QUIC|HTTPS)$/) {
@@ -415,14 +430,25 @@ parse_response() {
       # FROM: IP#PORT organization (geo)
       # PROTO: protocol [TLS details]
       nextpos = 0
-      rest = metadata
-      while ((spacepos = index(rest, " (")) > 0) {
-        nextpos += spacepos
-        rest = substr(rest, spacepos + 2)
+      # Find the opening parenthesis of the final balanced group from the
+      # right, so parentheses in either organization or geography are kept.
+      depth = 0
+      if (substr(metadata, length(metadata), 1) == ")") {
+        for (position = length(metadata); position > 0; position--) {
+          character = substr(metadata, position, 1)
+          if (character == ")") {
+            depth++
+          } else if (character == "(" && --depth == 0) {
+            if (position > 1 && substr(metadata, position - 1, 1) == " ") {
+              nextpos = position
+            }
+            break
+          }
+        }
       }
-      if (nextpos > 0 && substr(metadata, length(metadata), 1) == ")") {
+      if (nextpos > 0) {
         organization = trim(substr(metadata, 1, nextpos - 1))
-        geo = substr(metadata, nextpos + 2, length(metadata) - nextpos - 2)
+        geo = substr(metadata, nextpos + 1, length(metadata) - nextpos - 1)
       } else {
         organization = metadata
       }
@@ -696,6 +722,22 @@ for address in unknown:
 PY
 }
 
+stop_query() {
+  local exit_code="$1"
+  local pid
+
+  trap '' INT TERM
+  # dig is a direct asynchronous child. Inspect jobs instead of relying on
+  # $! having been assigned before a termination signal arrived.
+  jobs -pr > "$WORKER_PID_FILE" 2>/dev/null || true
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] && kill "$pid" 2>/dev/null || true
+  done < "$WORKER_PID_FILE"
+  wait 2>/dev/null || true
+  rm -f -- "$WORKER_PID_FILE"
+  exit "$exit_code"
+}
+
 run_query() {
   local outfile="$1"
   local rawfile="$2"
@@ -703,20 +745,31 @@ run_query() {
   local qname="${nonce}.test.dnscheck.tools"
   local result
   local parsed
+  local dig_pid
+
+  WORKER_PID_FILE="$rawfile.pids"
+  trap - EXIT
+  trap 'stop_query 130' INT
+  trap 'stop_query 143' TERM
 
   # Ensure every started job leaves a status record, even after an internal
   # failure. Successful and expected failure paths overwrite this marker.
   printf 'INTERNAL_ERROR\n' > "$outfile"
 
-  if ! result="$(dig "${DIG_BASE_ARGS[@]}" "$qname" TXT 2>&1)"; then
+  # Waiting for an asynchronous child allows signal traps to run immediately.
+  # Command substitution would leave dig behind when the worker is killed.
+  dig "${DIG_BASE_ARGS[@]}" "$qname" TXT > "$rawfile" 2>&1 &
+  dig_pid=$!
+  if ! wait "$dig_pid"; then
+    result="$(< "$rawfile")"
     result="${result//$'\n'/ }"
     result="${result//$'\t'/ }"
     printf 'DIG_ERROR\t%.240s\n' "${result:-dig returned an error}" > "$outfile"
+    rm -f -- "$rawfile"
     return 0
   fi
 
-  if ! parsed="$(printf '%s\n' "$result" | parse_response)"; then
-    printf '%s\n' "$result" > "$rawfile"
+  if ! parsed="$(parse_response < "$rawfile")"; then
     printf 'PARSE_ERROR\t%s\n' \
       'The response did not contain parseable resolver information.' \
       > "$outfile"
@@ -724,6 +777,7 @@ run_query() {
   fi
 
   printf 'OK\t%s\n' "$parsed" > "$outfile"
+  rm -f -- "$rawfile"
 }
 
 printf '%b=== DNS Resolver Test ===%b\n\n' "$BOLD" "$NC"
@@ -742,7 +796,9 @@ for ((i = 1; i <= QUERIES; i++)); do
   run_query "$WORK_DIR/query.$i" "$RAW_DIR/response.$i" "$nonce" &
   PIDS+=("$!")
 
-  if ((${#PIDS[@]} >= PARALLEL)); then
+  # wait -n may reap an already completed job while the pool is still full.
+  # Recheck capacity before allowing another query to start.
+  while ((${#PIDS[@]} >= PARALLEL)); do
     if ((HAVE_WAIT_N)); then
       wait -n || true
     else
@@ -751,7 +807,7 @@ for ((i = 1; i <= QUERIES; i++)); do
       wait "${PIDS[0]}" || true
     fi
     refresh_worker_pids
-  fi
+  done
 done
 
 wait || true
@@ -779,8 +835,20 @@ IFS=$'\t' read -r \
 
 BASE_RESULTS_FILE="$WORK_DIR/resolvers.tsv"
 awk -F '\t' '
-  $1 == "OK" && !seen[$2]++ {
-    print $3 "\t" $2 "\t" $4 "\t" $5
+  $1 == "OK" {
+    ip = $2
+    if (!seen[ip]++) {
+      organization[ip] = $3
+      geo[ip] = $4
+    }
+    if (!seen_protocol[ip, $5]++) {
+      protocols[ip] = protocols[ip] == "" ? $5 : protocols[ip] ", " $5
+    }
+  }
+  END {
+    for (ip in seen) {
+      print organization[ip] "\t" ip "\t" geo[ip] "\t" protocols[ip]
+    }
   }
 ' "$RESULT_DATA" \
   | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 \
