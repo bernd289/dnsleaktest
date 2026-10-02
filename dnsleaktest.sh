@@ -5,7 +5,8 @@ QUERIES=100
 TIMEOUT=3
 PARALLEL=20
 SOURCE_IP=""
-ENRICH_UNKNOWN=0
+ENRICH_UNKNOWN=1
+ENRICH_REQUIRED=0
 ENRICHMENT_BUDGET=30
 HAVE_WAIT_N=0
 
@@ -30,12 +31,12 @@ fi
 
 usage() {
   cat <<EOF
-Usage: ${0##*/} [-e] [-i source_ip] [-q queries] [-t timeout] [-p parallel]
+Usage: ${0##*/} [-e|-n] [-i source_ip] [-q queries] [-t timeout] [-p parallel]
 
 Options:
-  -e  Enrich missing resolver organizations. Checks dnscheck.tools known
-      ranges, then sends still-unknown resolver IPs to public RDAP services
-      (best effort; ${ENRICHMENT_BUDGET}s total budget; requires curl and Python 3)
+  -e  Explicitly enable metadata enrichment (enabled by default); require
+      curl and Python 3 instead of falling back to DNS-only if unavailable
+  -n  DNS-only: do not make any HTTP metadata requests
   -i  Source IPv4/IPv6 address for dig -b, e.g. 192.168.1.10
       (must be assigned locally; this is an IP address, not an interface name)
   -q  Number of DNS queries, default: 100, maximum: 100000
@@ -44,6 +45,14 @@ Options:
   -h  Show this help
 
 Interpretation:
+  Missing organizations and locations are enriched automatically when curl
+  and Python 3 are installed (best effort; ${ENRICHMENT_BUDGET}s total budget).
+  This sends resolver egress IPs to public RDAP services if needed; GeoIP
+  requests send /24 (IPv4) or /56 (IPv6) network addresses to ip.addr.tools.
+  Provider ranges come from dnscheck.tools, just as in its browser UI.
+  Existing DNS metadata is preserved. Locations are approximate GeoIP data,
+  not proof of the physical location of an anycast resolver.
+
   Multiple resolver IPs can be normal with anycast, load balancing, or multiple
   configured upstreams. A DNS leak is indicated only when an unexpected resolver
   or resolver organization appears. A non-/0 EDNS Client Subnet (ECS) means the
@@ -246,9 +255,10 @@ source_ip_is_local() {
   return 1
 }
 
-while getopts ":ei:q:t:p:h" opt; do
+while getopts ":eni:q:t:p:h" opt; do
   case "$opt" in
-    e) ENRICH_UNKNOWN=1 ;;
+    e) ENRICH_UNKNOWN=1; ENRICH_REQUIRED=1 ;;
+    n) ENRICH_UNKNOWN=0; ENRICH_REQUIRED=0 ;;
     i) SOURCE_IP="$OPTARG" ;;
     q) QUERIES="$OPTARG" ;;
     t) TIMEOUT="$OPTARG" ;;
@@ -299,10 +309,13 @@ for dependency in awk find sort mktemp; do
 done
 
 if ((ENRICH_UNKNOWN)); then
-  command -v curl >/dev/null 2>&1 \
-    || die "'curl' is required for provider enrichment."
-  command -v python3 >/dev/null 2>&1 \
-    || die "'python3' is required for provider enrichment."
+  if ! command -v curl >/dev/null 2>&1 ||
+     ! command -v python3 >/dev/null 2>&1; then
+    ((ENRICH_REQUIRED == 0)) \
+      || die "'curl' and 'python3' are required for metadata enrichment."
+    warn "Metadata enrichment unavailable (requires curl and Python 3); using DNS-only."
+    ENRICH_UNKNOWN=0
+  fi
 fi
 
 DIG_BASE_ARGS=(+short "+time=$TIMEOUT" +tries=1)
@@ -511,17 +524,19 @@ parse_response() {
   '
 }
 
-enrich_unknown_organizations() {
+enrich_missing_metadata() {
   local results_file="$1"
 
-  # dnscheck.tools enriches its browser results with known provider ranges and
-  # RDAP. Keep that optional here so the DNS-only test remains dependency-light.
+  # Use the same known-ranges/RDAP and prefix-cached GeoIP lookups as the
+  # dnscheck.tools browser UI. Never invent metadata on lookup failure.
   python3 - "$results_file" "$ENRICHMENT_BUDGET" <<'PY'
+import concurrent.futures
 import ipaddress
 import json
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -534,30 +549,34 @@ seen = set()
 with open(results_file, encoding="utf-8", errors="replace") as results:
     for line in results:
         fields = line.rstrip("\n").split("\t")
-        if len(fields) < 2 or fields[0] != "Unknown" or fields[1] in seen:
+        if (len(fields) < 3 or fields[1] in seen or
+                (fields[0] != "Unknown" and fields[2] != "Unknown")):
             continue
         try:
             address = ipaddress.ip_address(fields[1])
         except ValueError:
             continue
+        # Local/special-use resolver addresses cannot be publicly geolocated.
+        if not address.is_global:
+            continue
         seen.add(fields[1])
-        unknown.append(address)
+        unknown.append((address, fields[0] == "Unknown", fields[2] == "Unknown"))
 
 # Always emit a header so the mapping file is non-empty even when every lookup
 # fails. This also keeps the following POSIX awk join correct.
-print("#resolver\torganization")
+print("#resolver\torganization\tgeo")
 if not unknown:
     raise SystemExit
 
 
-def get_json(url, attempts=3, request_cap=10.0):
+def get_json(url, attempts=1, request_cap=4.0):
     last_error = None
     for attempt in range(attempts):
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("provider enrichment time budget exhausted")
+        if remaining <= 0.05:
+            raise TimeoutError("metadata enrichment time budget exhausted")
 
-        request_timeout = min(request_cap, max(0.5, remaining))
+        request_timeout = min(request_cap, remaining)
         connect_timeout = min(4.0, request_timeout)
         try:
             completed = subprocess.run(
@@ -570,9 +589,9 @@ def get_json(url, attempts=3, request_cap=10.0):
                     "--max-redirs",
                     "5",
                     "--connect-timeout",
-                    f"{connect_timeout:.1f}",
+                    f"{connect_timeout:.3f}",
                     "--max-time",
-                    f"{request_timeout:.1f}",
+                    f"{request_timeout:.3f}",
                     "--proto",
                     "=https",
                     "--proto-redir",
@@ -580,13 +599,13 @@ def get_json(url, attempts=3, request_cap=10.0):
                     "--header",
                     "Accept: application/rdap+json, application/json",
                     "--user-agent",
-                    "dnsleaktest/rdap-enrichment",
+                    "dnsleaktest/metadata-enrichment",
                     url,
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=request_timeout + 1,
+                timeout=request_timeout + 0.25,
             )
             return json.loads(completed.stdout)
         except Exception as error:
@@ -604,11 +623,11 @@ def get_json(url, attempts=3, request_cap=10.0):
 
 known_ranges = []
 try:
-    for obj in get_json(
+    range_objects = get_json(
         "https://dnscheck.tools/known-ipranges.json",
-        attempts=2,
-        request_cap=5.0,
-    ):
+        request_cap=3.0,
+    ) if any(need_provider for _, need_provider, _ in unknown) else []
+    for obj in range_objects:
         description = obj.get("desc")
         if not isinstance(description, str) or not description:
             continue
@@ -633,25 +652,54 @@ def known_description(address):
 
 
 rdap_cache = []
+rdap_services = {}
+rdap_lock = threading.Lock()
 
 
 def rdap_lookup(address):
-    for start, end, data in rdap_cache:
-        if start.version == address.version and start <= address <= end:
-            return data
-
-    encoded = urllib.parse.quote(str(address), safe=":")
-    data = get_json(
-        "https://rdap-bootstrap.arin.net/bootstrap/ip/" + encoded
-    )
-    try:
-        start = ipaddress.ip_address(data["startAddress"])
-        end = ipaddress.ip_address(data["endAddress"])
-        if start.version == address.version and end.version == address.version:
-            rdap_cache.append((start, end, data))
-    except (KeyError, ValueError):
-        pass
-    return data
+    # Like the site's RDAP client, use IANA bootstrap to contact the RIR
+    # directly and cache returned address ranges. Serialize cache misses so
+    # many egress IPs in one allocation do not trigger duplicate requests.
+    with rdap_lock:
+        for start, end, data in rdap_cache:
+            if start.version == address.version and start <= address <= end:
+                return data
+        if address.version not in rdap_services:
+            rdap_services[address.version] = []
+            bootstrap = get_json(
+                f"https://data.iana.org/rdap/ipv{address.version}.json"
+            )
+            for cidrs, urls in bootstrap.get("services", []):
+                service = next((url for url in urls
+                                if isinstance(url, str) and url.startswith("https://")), None)
+                if not service:
+                    continue
+                for cidr in cidrs:
+                    try:
+                        network = ipaddress.ip_network(cidr, strict=False)
+                    except ValueError:
+                        continue
+                    if network.version == address.version:
+                        rdap_services[address.version].append((network, service))
+            rdap_services[address.version].sort(key=lambda item: item[0].prefixlen,
+                                               reverse=True)
+        service = next((url for network, url in rdap_services[address.version]
+                        if address in network), None)
+        if service is None:
+            raise ValueError("No HTTPS RDAP service found")
+        encoded = urllib.parse.quote(str(address), safe=":")
+        data = get_json(service.rstrip("/") + "/ip/" + encoded)
+        if not isinstance(data, dict):
+            raise ValueError("Invalid RDAP response")
+        try:
+            start = ipaddress.ip_address(data["startAddress"])
+            end = ipaddress.ip_address(data["endAddress"])
+            if (start.version == address.version and end.version == address.version
+                    and start <= address <= end):
+                rdap_cache.append((start, end, data))
+        except (KeyError, ValueError):
+            pass
+        return data
 
 
 def vcard_name(entity):
@@ -699,23 +747,67 @@ def provider_from_rdap(data):
 
 
 def sanitize(value):
-    return value.replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", value).strip()
 
 
-for address in unknown:
+geo_cache = {}
+geo_locks = {}
+geo_lock = threading.Lock()
+
+
+def get_geo(address):
+    # The website uses the first IP of the /24 or /56, not the exact resolver
+    # IP. Deduplicate these lookups across all egress IPs in the same prefix.
+    prefix = 24 if address.version == 4 else 56
+    network = ipaddress.ip_network(f"{address}/{prefix}", strict=False)
+    network_ip = str(network.network_address)
+    with geo_lock:
+        lookup_lock = geo_locks.setdefault(network_ip, threading.Lock())
+    with lookup_lock:
+        if network_ip in geo_cache:
+            return geo_cache[network_ip]
+        geo = ""
+        try:
+            encoded = urllib.parse.quote(network_ip, safe=":")
+            data = get_json("https://ip.addr.tools/" + encoded)
+            if isinstance(data, dict):
+                parts = [sanitize(data.get(key)) for key in ("city", "region", "country")]
+                geo = ", ".join(part for part in parts if part)
+        except Exception:
+            # A failed or rate-limited service must not hide the DNS results.
+            pass
+        geo_cache[network_ip] = geo
+        return geo
+
+
+def enrich_one(target):
+    address, need_provider, need_geo = target
     description = known_description(address)
-    if description and "{}" not in description:
+    provider = ""
+    geo = ""
+    if need_provider and description and "{}" not in description:
         provider = description
-    else:
+    if need_geo:
+        geo = get_geo(address)
+    if need_provider and not provider:
         try:
             provider = provider_from_rdap(rdap_lookup(address))
         except Exception:
-            provider = None
-        if provider and description:
-            provider = description.replace("{}", provider)
+            provider = ""
+    if provider and description and "{}" in description:
+        provider = description.replace("{}", provider)
+    provider = sanitize(provider) or "Unknown"
+    geo = sanitize(geo) if need_geo else ""
+    return str(address), provider, geo or "Unknown"
 
-    if provider:
-        print(f"{address}\t{sanitize(provider)}")
+
+# Bound concurrency and share one deadline across all HTTP requests.
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    for address, provider, geo in executor.map(enrich_one, unknown):
+        if provider != "Unknown" or geo != "Unknown":
+            print(f"{address}\t{provider}\t{geo}")
 PY
 }
 
@@ -885,41 +977,45 @@ fi
 
 RESULTS_FILE="$BASE_RESULTS_FILE"
 ENRICHMENT_TARGET_COUNT="$(
-  awk -F '\t' '$1 == "Unknown" { count++ } END { print count + 0 }' \
+  awk -F '\t' '$1 == "Unknown" || $3 == "Unknown" { count++ } END { print count + 0 }' \
     "$BASE_RESULTS_FILE"
 )"
 ENRICHED_COUNT=0
 
 if ((ENRICH_UNKNOWN && ENRICHMENT_TARGET_COUNT > 0)); then
-  printf 'Enriching %d unidentified resolver(s) (up to %ds)...\n' \
+  printf 'Enriching missing metadata for %d resolver(s) (up to %ds)...\n' \
     "$ENRICHMENT_TARGET_COUNT" "$ENRICHMENT_BUDGET"
-  PROVIDER_MAP="$WORK_DIR/provider-map.tsv"
-  if enrich_unknown_organizations "$BASE_RESULTS_FILE" > "$PROVIDER_MAP"; then
+  METADATA_MAP="$WORK_DIR/metadata-map.tsv"
+  if enrich_missing_metadata "$BASE_RESULTS_FILE" > "$METADATA_MAP"; then
     ENRICHED_COUNT="$(
-      awk -F '\t' '$1 != "#resolver" && NF >= 2 { count++ } END { print count + 0 }' \
-        "$PROVIDER_MAP"
+      awk -F '\t' '$1 != "#resolver" && NF >= 3 { count++ } END { print count + 0 }' \
+        "$METADATA_MAP"
     )"
     ENRICHED_RESULTS_FILE="$WORK_DIR/enriched-resolvers.tsv"
     awk -F '\t' '
       BEGIN { OFS = "\t" }
       NR == FNR {
-        if ($1 != "#resolver" && NF >= 2) {
+        if ($1 != "#resolver" && NF >= 3) {
           provider[$1] = $2
+          location[$1] = $3
         }
         next
       }
       {
-        if ($1 == "Unknown" && $2 in provider) {
+        if ($1 == "Unknown" && $2 in provider && provider[$2] != "Unknown") {
           $1 = provider[$2]
+        }
+        if ($3 == "Unknown" && $2 in location && location[$2] != "Unknown") {
+          $3 = location[$2]
         }
         print
       }
-    ' "$PROVIDER_MAP" "$BASE_RESULTS_FILE" \
+    ' "$METADATA_MAP" "$BASE_RESULTS_FILE" \
       | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 \
       > "$ENRICHED_RESULTS_FILE"
     RESULTS_FILE="$ENRICHED_RESULTS_FILE"
   else
-    warn "Provider enrichment failed; DNS results remain usable."
+    warn "Metadata enrichment failed; DNS results remain usable."
   fi
 fi
 
@@ -1002,13 +1098,17 @@ printf '%d/%d queries returned parseable resolver information.\n' \
   "$SUCCESS_COUNT" "$QUERIES"
 
 if ((ENRICHED_COUNT > 0)); then
-  printf '%d/%d previously unidentified resolver(s) enriched via known ranges/RDAP.\n' \
+  printf 'Missing metadata supplemented for %d/%d resolver(s) via known ranges/RDAP/GeoIP.\n' \
     "$ENRICHED_COUNT" "$ENRICHMENT_TARGET_COUNT"
 fi
-if ((ENRICH_UNKNOWN && ENRICHMENT_TARGET_COUNT > ENRICHED_COUNT)); then
-  printf '%bProvider enrichment left %d resolver(s) unidentified; DNS results remain valid.%b\n' \
+REMAINING_METADATA_COUNT="$(
+  awk -F '\t' '$1 == "Unknown" || $3 == "Unknown" { count++ } END { print count + 0 }' \
+    "$RESULTS_FILE"
+)"
+if ((ENRICH_UNKNOWN && REMAINING_METADATA_COUNT > 0)); then
+  printf '%bMetadata enrichment left %d resolver(s) with missing fields; DNS results remain valid.%b\n' \
     "$YELLOW" \
-    "$((ENRICHMENT_TARGET_COUNT - ENRICHED_COUNT))" \
+    "$REMAINING_METADATA_COUNT" \
     "$NC"
 fi
 
