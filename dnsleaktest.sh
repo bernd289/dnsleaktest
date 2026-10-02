@@ -375,6 +375,12 @@ parse_response() {
       return value
     }
 
+    function is_protocol(value) {
+      value = toupper(trim(value))
+      return value == "UDP" || value == "TCP" || value == "TLS" ||
+             value == "QUIC" || value == "HTTPS"
+    }
+
     # Return the matching closing parenthesis, allowing nested metadata.
     function group_end(value, position, depth, character) {
       depth = 0
@@ -391,7 +397,7 @@ parse_response() {
 
     function parse_from(value, endpoint, metadata, hashpos, spacepos,
                         closepos, rest, nextpos, position, depth,
-                        character) {
+                        character, group, metadata_count) {
       value = trim(value)
       spacepos = index(value, " ")
       if (spacepos > 0) {
@@ -414,23 +420,24 @@ parse_response() {
       # Some deployments render every metadata field in parentheses:
       # FROM: IP#PORT (organization) (geo) (protocol)
       if (substr(metadata, 1, 1) == "(") {
-        # Organization and geography are optional. Read the trailing
-        # protocol first, including responses containing only (UDP).
-        if (match(metadata, /\((UDP|TCP|TLS|QUIC|HTTPS)\)$/)) {
-          protocol = substr(metadata, RSTART + 1, RLENGTH - 2)
-          metadata = trim(substr(metadata, 1, RSTART - 1))
-        }
+        # Classify each balanced group instead of depending on a protocol
+        # regex at the exact end of the TXT value. A transport label must
+        # never occupy an organization/geography slot.
         rest = metadata
-        closepos = group_end(rest)
-        if (closepos > 1) {
-          organization = substr(rest, 2, closepos - 2)
-          rest = trim(substr(rest, closepos + 1))
-        }
-        if (substr(rest, 1, 1) == "(") {
+        metadata_count = 0
+        while (substr(rest, 1, 1) == "(") {
           closepos = group_end(rest)
-          if (closepos > 1) {
-            geo = substr(rest, 2, closepos - 2)
-            rest = trim(substr(rest, closepos + 1))
+          if (closepos < 2) {
+            break
+          }
+          group = trim(substr(rest, 2, closepos - 2))
+          rest = trim(substr(rest, closepos + 1))
+          if (is_protocol(group)) {
+            protocol = toupper(group)
+          } else if (++metadata_count == 1) {
+            organization = group
+          } else if (metadata_count == 2) {
+            geo = group
           }
         }
         return
@@ -504,6 +511,21 @@ parse_response() {
     END {
       if (resolver == "") {
         exit 1
+      }
+
+      # Also protect legacy/separate-field replies and unusual FROM layouts:
+      # repair a misplaced transport before enrichment and organization counts.
+      if (is_protocol(organization)) {
+        if (protocol == "" || protocol == "Unknown") {
+          protocol = toupper(trim(organization))
+        }
+        organization = ""
+      }
+      if (is_protocol(geo)) {
+        if (protocol == "" || protocol == "Unknown") {
+          protocol = toupper(trim(geo))
+        }
+        geo = ""
       }
 
       if (organization == "") {
