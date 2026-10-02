@@ -54,6 +54,12 @@ if mode == "protocol_only":
           + ("UDP" if number % 2 else "TCP") + ')"')
     print('"ECS: 0.0.0.0/0"')
     raise SystemExit
+if mode == "misplaced_protocol":
+    ip = "172.69.149.40" if number % 2 else "185.150.99.1"
+    print('"resolver: ' + ip + '"')
+    print('"resolverOrg: UDP"')
+    print('"proto: Unknown"')
+    raise SystemExit
 if mode == "ipv6_protocol_only":
     print('"FROM: 2400:cb00:696:1024::ac45:'
           + ("9528" if number % 2 else "9529") + '#123 (UDP)"')
@@ -127,6 +133,20 @@ class ParserTests(unittest.TestCase):
              ["192.0.2.1", "Unknown", "Unknown", "Unknown", "Unknown"]),
             ('"FROM: 192.0.2.1#123 (Example Inc) (Berlin, DE)"\n"PROTO: TCP"',
              ["192.0.2.1", "Example Inc", "Berlin, DE", "TCP", "Unknown"]),
+            ('"FROM: 192.0.2.1#123 (UDP) extra text"',
+             ["192.0.2.1", "Unknown", "Unknown", "UDP", "Unknown"]),
+            ('"FROM: 192.0.2.1#123 ( UDP )"',
+             ["192.0.2.1", "Unknown", "Unknown", "UDP", "Unknown"]),
+            ('"FROM: 192.0.2.1#123 (udp)"',
+             ["192.0.2.1", "Unknown", "Unknown", "UDP", "Unknown"]),
+            ('"FROM: 192.0.2.1#123 (Example Inc) (Berlin, DE) (UDP) extra text"',
+             ["192.0.2.1", "Example Inc", "Berlin, DE", "UDP", "Unknown"]),
+            ('"resolver: 192.0.2.1"\n"resolverOrg: UDP"\n"proto: Unknown"',
+             ["192.0.2.1", "Unknown", "Unknown", "UDP", "Unknown"]),
+            ('"FROM: 192.0.2.1#123 UDP"',
+             ["192.0.2.1", "Unknown", "Unknown", "UDP", "Unknown"]),
+            ('"FROM: 192.0.2.1#123 Example Inc (TCP)"',
+             ["192.0.2.1", "Example Inc", "Unknown", "TCP", "Unknown"]),
         ]
         for endpoint in ("192.0.2.1", "2001:db8::1"):
             for protocol in ("UDP", "TCP", "TLS", "QUIC", "HTTPS"):
@@ -250,6 +270,35 @@ class IntegrationTests(unittest.TestCase):
             "https://dnscheck.tools/known-ipranges.json",
             "https://ip.addr.tools/172.69.149.0",
         ])
+
+    def test_transport_labels_cannot_hide_multiple_organizations(self):
+        self.env["MOCK_MODE"] = "misplaced_protocol"
+        self.set_http({
+            "https://dnscheck.tools/known-ipranges.json": [
+                {"desc": "Cloudflare", "ranges": ["172.69.149.0/24"]},
+                {"desc": "Example DNS", "ranges": ["185.150.99.0/24"]},
+            ],
+            "https://ip.addr.tools/172.69.149.0": {"city": "Frankfurt", "country": "DE"},
+            "https://ip.addr.tools/185.150.99.0": {"city": "Munich", "country": "DE"},
+        })
+        result = self.run_script("-q", "6", "-p", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Cloudflare | 172.69.149.40 | Frankfurt, DE | UDP", result.stdout)
+        self.assertIn("Example DNS | 185.150.99.1 | Munich, DE | UDP", result.stdout)
+        self.assertIn("2 resolver egress IP(s) across 2 organization(s).", result.stdout)
+        self.assertIn("Multiple resolver organizations detected.", result.stdout)
+        self.assertNotIn("egress IPs from one organization", result.stdout)
+        self.assertNotIn(" UDP | ", result.stdout)
+
+    def test_unidentified_providers_are_not_counted_as_one_udp_organization(self):
+        self.env["MOCK_MODE"] = "misplaced_protocol"
+        result = self.run_script("-n", "-q", "6", "-p", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Unknown | 172.69.149.40 | Unknown | UDP", result.stdout)
+        self.assertIn("Unknown | 185.150.99.1 | Unknown | UDP", result.stdout)
+        self.assertIn("0 identified organization(s), 2 resolver(s) with unknown organization",
+                      result.stdout)
+        self.assertNotIn("across 1 organization(s)", result.stdout)
 
     def test_complete_dns_metadata_does_not_make_http_requests(self):
         result = self.run_script("-q", "2")
