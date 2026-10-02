@@ -48,6 +48,11 @@ if mode == "failure":
 if mode == "unparseable":
     print('"ID: 123"')
     raise SystemExit
+if mode == "protocol_only":
+    print('"FROM: 192.0.2.' + str(1 if number % 2 else 2) + '#123 ('
+          + ("UDP" if number % 2 else "TCP") + ')"')
+    print('"ECS: 0.0.0.0/0"')
+    raise SystemExit
 
 print('"FROM: 192.0.2.1#123 Example Inc (Berlin, DE)"')
 print('"PROTO: ' + ("UDP" if number % 2 else "TCP") + '"')
@@ -86,7 +91,24 @@ class ParserTests(unittest.TestCase):
             ('"resolver: 192.0.2.1"\n"resolverOrg: Example Inc"\n'
              '"resolverGeo: Berlin, DE"\n"proto: UDP"\n"clientSubnet: None"',
              ["192.0.2.1", "Example Inc", "Berlin, DE", "UDP", "None"]),
+            ('"FROM: 192.0.2.1#123"',
+             ["192.0.2.1", "Unknown", "Unknown", "Unknown", "Unknown"]),
+            ('"FROM: 192.0.2.1#123 (Example Inc) (Berlin, DE)"\n"PROTO: TCP"',
+             ["192.0.2.1", "Example Inc", "Berlin, DE", "TCP", "Unknown"]),
         ]
+        for endpoint in ("192.0.2.1", "2001:db8::1"):
+            for protocol in ("UDP", "TCP", "TLS", "QUIC", "HTTPS"):
+                for metadata, organization, geo in (
+                    ("", "Unknown", "Unknown"),
+                    ("(Example (Europe) Ltd) ", "Example (Europe) Ltd", "Unknown"),
+                    ("(Example (Europe) Ltd) (Berlin (City), DE) ",
+                     "Example (Europe) Ltd", "Berlin (City), DE"),
+                ):
+                    cases.append((
+                        f'"FROM: {endpoint}#123 {metadata}({protocol})"\n'
+                        '"ECS: 192.0.2.0/24 scope/0"',
+                        [endpoint, organization, geo, protocol, "192.0.2.0/24"],
+                    ))
         for response, expected in cases:
             with self.subTest(response=response):
                 result = subprocess.run(
@@ -150,6 +172,35 @@ class IntegrationTests(unittest.TestCase):
                 result = self.run_script("-q", "1")
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(expected, result.stderr)
+
+    def test_protocol_only_responses_report_unknown_organizations(self):
+        self.env["MOCK_MODE"] = "protocol_only"
+        result = self.run_script("-q", "6", "-p", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Unknown | 192.0.2.1 | Unknown | UDP", result.stdout)
+        self.assertIn("Unknown | 192.0.2.2 | Unknown | TCP", result.stdout)
+        self.assertIn("2 resolver egress IP(s): 0 identified organization(s), "
+                      "2 resolver(s) with unknown organization.", result.stdout)
+        self.assertIn("6/6 queries", result.stdout)
+        self.assertIn("At least one resolver organization could not be identified.",
+                      result.stdout)
+
+    def test_protocol_only_responses_can_be_enriched(self):
+        self.env["MOCK_MODE"] = "protocol_only"
+        mock_curl = self.root / "curl"
+        mock_curl.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, sys\n"
+            "assert sys.argv[-1] == 'https://dnscheck.tools/known-ipranges.json'\n"
+            "print(json.dumps([{'desc': 'Example DNS', 'ranges': ['192.0.2.0/24']}]))\n"
+        )
+        mock_curl.chmod(0o755)
+        result = self.run_script("-e", "-q", "6", "-p", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Example DNS | 192.0.2.1 | Unknown | UDP", result.stdout)
+        self.assertIn("Example DNS | 192.0.2.2 | Unknown | TCP", result.stdout)
+        self.assertIn("2 resolver egress IP(s) across 1 organization(s).", result.stdout)
+        self.assertIn("2/2 previously unidentified resolver(s) enriched", result.stdout)
 
     def test_signals_reap_dig_children_and_remove_work_directory(self):
         for sig in (signal.SIGTERM, signal.SIGINT):
