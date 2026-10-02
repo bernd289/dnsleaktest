@@ -377,7 +377,7 @@ parse_response() {
     }
 
     function parse_from(value, endpoint, metadata, hashpos, spacepos,
-                        group, closepos, rest, nextpos, position, depth,
+                        closepos, rest, nextpos, position, depth,
                         character) {
       value = trim(value)
       spacepos = index(value, " ")
@@ -401,6 +401,12 @@ parse_response() {
       # Some deployments render every metadata field in parentheses:
       # FROM: IP#PORT (organization) (geo) (protocol)
       if (substr(metadata, 1, 1) == "(") {
+        # Organization and geography are optional. Read the trailing
+        # protocol first, including responses containing only (UDP).
+        if (match(metadata, /\((UDP|TCP|TLS|QUIC|HTTPS)\)$/)) {
+          protocol = substr(metadata, RSTART + 1, RLENGTH - 2)
+          metadata = trim(substr(metadata, 1, RSTART - 1))
+        }
         rest = metadata
         closepos = group_end(rest)
         if (closepos > 1) {
@@ -414,19 +420,10 @@ parse_response() {
             rest = trim(substr(rest, closepos + 1))
           }
         }
-        if (substr(rest, 1, 1) == "(") {
-          closepos = group_end(rest)
-          if (closepos > 1) {
-            group = substr(rest, 2, closepos - 2)
-            if (group ~ /^(UDP|TCP|TLS|QUIC|HTTPS)$/) {
-              protocol = group
-            }
-          }
-        }
         return
       }
 
-      # Current upstream format:
+      # Earlier upstream format:
       # FROM: IP#PORT organization (geo)
       # PROTO: protocol [TLS details]
       nextpos = 0
